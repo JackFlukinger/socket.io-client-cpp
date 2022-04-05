@@ -71,7 +71,7 @@ namespace sio
         sync_close();
     }
     
-    void client_impl::connect(const string& uri, const map<string,string>& query, const map<string, string>& headers)
+    void client_impl::connect(const string& uri, const map<string,string>& query, const map<string, string>& headers, const message::ptr& auth)
     {
         if(m_reconn_timer)
         {
@@ -109,8 +109,10 @@ namespace sio
         m_query_string=move(query_str);
 
         m_http_headers = headers;
+        m_auth = auth;
 
         this->reset_states();
+        m_abort_retries = false;
         m_client.get_io_service().dispatch(std::bind(&client_impl::connect_impl,this,uri,m_query_string));
         m_network_thread.reset(new thread(std::bind(&client_impl::run_loop,this)));//uri lifecycle?
 
@@ -141,7 +143,7 @@ namespace sio
         }
         else
         {
-            pair<const string, socket::ptr> p(aux,shared_ptr<sio::socket>(new sio::socket(this,aux)));
+            pair<const string, socket::ptr> p(aux,shared_ptr<sio::socket>(new sio::socket(this,aux,m_auth)));
             return (m_sockets.insert(p).first)->second;
         }
     }
@@ -149,6 +151,7 @@ namespace sio
     void client_impl::close()
     {
         m_con_state = con_closing;
+        m_abort_retries = true;
         this->sockets_invoke_void(&sio::socket::close);
         m_client.get_io_service().dispatch(std::bind(&client_impl::close_impl, this,close::status::normal,"End by user"));
     }
@@ -156,6 +159,7 @@ namespace sio
     void client_impl::sync_close()
     {
         m_con_state = con_closing;
+        m_abort_retries = true;
         this->sockets_invoke_void(&sio::socket::close);
         m_client.get_io_service().dispatch(std::bind(&client_impl::close_impl, this,close::status::normal,"End by user"));
         if(m_network_thread)
@@ -303,37 +307,14 @@ namespace sio
         }
     }
 
-    void client_impl::ping(const asio::error_code& ec)
-    {
-        if(ec || m_con.expired())
-        {
-            if (ec != asio::error::operation_aborted)
-                LOG("ping exit,con is expired?"<<m_con.expired()<<",ec:"<<ec.message()<<endl);
-            return;
-        }
-        packet p(packet::frame_ping);
-        m_packet_mgr.encode(p, [&](bool /*isBin*/,shared_ptr<const string> payload)
-        {
-            lib::error_code ec;
-            this->m_client.send(this->m_con, *payload, frame::opcode::text, ec);
-        });
-        if(!m_ping_timeout_timer)
-        {
-            m_ping_timeout_timer.reset(new asio::steady_timer(m_client.get_io_service()));
-            std::error_code timeout_ec;
-            m_ping_timeout_timer->expires_from_now(milliseconds(m_ping_timeout), timeout_ec);
-            m_ping_timeout_timer->async_wait(std::bind(&client_impl::timeout_pong, this, std::placeholders::_1));
-        }
-    }
-
-    void client_impl::timeout_pong(const asio::error_code &ec)
+    void client_impl::timeout_ping(const asio::error_code &ec)
     {
         if(ec)
         {
             return;
         }
-        LOG("Pong timeout"<<endl);
-        m_client.get_io_service().dispatch(std::bind(&client_impl::close_impl, this,close::status::policy_violation,"Pong timeout"));
+        LOG("Ping timeout"<<endl);
+        m_client.get_io_service().dispatch(std::bind(&client_impl::close_impl, this,close::status::policy_violation,"Ping timeout"));
     }
 
     void client_impl::timeout_reconnect(asio::error_code const& ec)
@@ -398,7 +379,7 @@ namespace sio
         m_con_state = con_closed;
         this->sockets_invoke_void(&sio::socket::on_disconnect);
         LOG("Connection failed." << endl);
-        if(m_reconn_made<m_reconn_attempts)
+        if(m_reconn_made<m_reconn_attempts && !m_abort_retries)
         {
             LOG("Reconnect for attempt:"<<m_reconn_made<<endl);
             unsigned delay = this->next_delay();
@@ -462,7 +443,7 @@ namespace sio
         else
         {
             this->sockets_invoke_void(&sio::socket::on_disconnect);
-            if(m_reconn_made<m_reconn_attempts)
+            if(m_reconn_made<m_reconn_attempts && !m_abort_retries)
             {
                 LOG("Reconnect for attempt:"<<m_reconn_made<<endl);
                 unsigned delay = this->next_delay();
@@ -484,11 +465,6 @@ namespace sio
     
     void client_impl::on_message(connection_hdl, client_type::message_ptr msg)
     {
-        if (m_ping_timeout_timer) {
-            asio::error_code ec;
-            m_ping_timeout_timer->expires_from_now(milliseconds(m_ping_timeout),ec);
-            m_ping_timeout_timer->async_wait(std::bind(&client_impl::timeout_pong, this, std::placeholders::_1));
-        }
         // Parse the incoming message according to socket.IO rules
         m_packet_mgr.put_payload(msg->get_payload());
     }
@@ -525,6 +501,9 @@ namespace sio
                 m_ping_timeout = 60000;
             }
 
+            // Start ping timeout
+            update_ping_timeout_timer();
+
             return;
         }
 failed:
@@ -534,17 +513,15 @@ failed:
 
     void client_impl::on_ping()
     {
+        // Reply with pong packet.
         packet p(packet::frame_pong);
         m_packet_mgr.encode(p, [&](bool /*isBin*/,shared_ptr<const string> payload)
         {
             this->m_client.send(this->m_con, *payload, frame::opcode::text);
         });
 
-        if(m_ping_timeout_timer)
-        {
-            m_ping_timeout_timer->cancel();
-            m_ping_timeout_timer.reset();
-        }
+        // Reset the ping timeout.
+        update_ping_timeout_timer();
     }
 
     void client_impl::on_decode(packet const& p)
@@ -589,6 +566,16 @@ failed:
             m_ping_timeout_timer.reset();
         }
     }
+
+    void client_impl::update_ping_timeout_timer() {
+        if (!m_ping_timeout_timer) {
+            m_ping_timeout_timer = std::unique_ptr<asio::steady_timer>(new asio::steady_timer(get_io_service()));
+        }
+
+        asio::error_code ec;
+        m_ping_timeout_timer->expires_from_now(milliseconds(m_ping_interval + m_ping_timeout), ec);
+        m_ping_timeout_timer->async_wait(std::bind(&client_impl::timeout_ping, this, std::placeholders::_1));
+    }
     
     void client_impl::reset_states()
     {
@@ -600,10 +587,12 @@ failed:
 #if SIO_TLS
     client_impl::context_ptr client_impl::on_tls_init(connection_hdl conn)
     {
-        context_ptr ctx = context_ptr(new  asio::ssl::context(asio::ssl::context::tlsv12));
+        context_ptr ctx = context_ptr(new  asio::ssl::context(asio::ssl::context::tls));
         asio::error_code ec;
         ctx->set_options(asio::ssl::context::default_workarounds |
-                             asio::ssl::context::single_dh_use,ec);
+                         asio::ssl::context::no_tlsv1 |
+                         asio::ssl::context::no_tlsv1_1 |
+                         asio::ssl::context::single_dh_use,ec);
         if(ec)
         {
             cerr<<"Init tls failed,reason:"<< ec.message()<<endl;
